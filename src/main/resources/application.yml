@@ -1,0 +1,127 @@
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: his-rag
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      indent-output: true
+
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+  elasticsearch:
+    uris: ${ES_URIS:http://localhost:9200}
+    username: ${ES_USERNAME:}
+    password: ${ES_PASSWORD:}
+    connection-timeout: 5s
+    socket-timeout: 30s
+
+  # pgvector 所在库；initialization-fail-timeout=-1 保证库未启动时应用仍可起来
+  datasource:
+    url: ${PG_URL:jdbc:postgresql://localhost:5432/his_rag}
+    username: ${PG_USER:postgres}
+    password: ${PG_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      initialization-fail-timeout: -1
+      connection-timeout: 5000
+      maximum-pool-size: 10
+      pool-name: his-rag-pool
+
+rag:
+  embedding:
+    # OpenAI 兼容的 Embedding 接口地址（如 OpenAI / 通义 / 智谱 / 本地 vLLM / Ollama 等）
+    base-url: ${RAG_EMBEDDING_BASE_URL:https://api.openai.com/v1}
+    api-key: ${RAG_EMBEDDING_API_KEY:}
+    model: ${RAG_EMBEDDING_MODEL:text-embedding-3-small}
+    dimension: 1536
+    batch-size: 16
+
+  llm:
+    # OpenAI 兼容的 Chat 接口地址
+    base-url: ${RAG_LLM_BASE_URL:https://api.openai.com/v1}
+    api-key: ${RAG_LLM_API_KEY:}
+    model: ${RAG_LLM_MODEL:gpt-4o-mini}
+    temperature: 0.2
+    max-tokens: 1024
+
+  bm25:
+    # memory        = 内存倒排索引（零依赖，本地开发用）
+    # elasticsearch = Elasticsearch BM25（生产推荐）
+    backend: ${RAG_BM25_BACKEND:memory}
+    index-name: ${RAG_BM25_INDEX:his_rag_chunks}
+    # 建议 ES 安装 IK 分词插件后改为 ik_max_word；未安装时请保持 standard
+    analyzer: ${RAG_BM25_ANALYZER:standard}
+
+  vector:
+    # memory   = 内存暴力检索（零依赖，本地开发用）
+    # pgvector = PostgreSQL + pgvector 扩展（生产推荐）
+    backend: ${RAG_VECTOR_BACKEND:memory}
+    table: ${RAG_VECTOR_TABLE:his_rag_chunks}
+    # 必须与 embedding 模型输出维度一致
+    dimension: ${RAG_VECTOR_DIMENSION:1536}
+    # hnsw | ivfflat | none
+    index-type: ${RAG_VECTOR_INDEX:hnsw}
+
+  hybrid:
+    # local         = 向量库 + BM25 索引两路召回，在 Java 侧做 RRF / 加权融合
+    # elasticsearch = 文本与向量同存一个 ES 索引，由 ES 单次查询完成召回与融合（生产推荐）
+    # 注意：设为 elasticsearch 后，bm25.backend 与 vector.backend 不再参与检索与入库
+    backend: ${RAG_HYBRID_BACKEND:local}
+    index-name: ${RAG_HYBRID_INDEX:his_rag_hybrid}
+    # 必须与 embedding 模型输出维度一致（dense_vector 建索引后不可改，改维度需重建索引）
+    dimension: ${RAG_HYBRID_DIMENSION:1536}
+    # 建议安装 IK 插件后改为 ik_max_word；未安装时保持 standard
+    analyzer: ${RAG_HYBRID_ANALYZER:standard}
+    # rrf = ES 8.8+ 原生 RRF（rank.rrf，按排名融合，对两路分数量纲不敏感）
+    # knn = query 与 knn 并列，由 ES 把两路 _score 加权求和，配合 text-boost / knn-boost 调权
+    fusion: ${RAG_HYBRID_FUSION:rrf}
+    knn-k: 100              # kNN 每分片返回的候选数
+    num-candidates: 200     # kNN 每分片探索的候选数，需 >= knn-k
+    rank-constant: 60       # RRF 平滑常数
+    window-size: 100        # RRF 参与排序的窗口大小
+    text-boost: 1.0         # 全文检索权重（仅 fusion=knn 生效）
+    knn-boost: 1.0          # 向量检索权重（仅 fusion=knn 生效）
+
+  retrieval:
+    vector-top-k: 20        # 向量召回候选数
+    bm25-top-k: 20          # BM25 召回候选数
+    candidate-top-k: 30     # 送入 rerank 的候选数
+    final-top-k: 5          # 最终进入生成上下文的片段数
+    vector-weight: 0.6      # 加权融合时向量权重
+    bm25-weight: 0.4        # 加权融合时 BM25 权重
+    use-rrf: true           # true=RRF 融合, false=加权归一化融合
+    rrf-k: 60               # RRF 平滑常数
+    enable-rerank: true     # 是否启用 LLM 重排
+
+  chunk:
+    size: 400               # 切片长度（字符）
+    overlap: 80             # 相邻切片重叠长度（字符）
+
+  security:
+    mask-pii: true          # 输出前是否对隐私信息脱敏
+
+  cache:
+    enabled: true
+    # 命中阈值：查询向量余弦相似度需 >= 该值（越高越严格，0.95 约等于「换种说法问同一件事」）
+    similarity-threshold: 0.95
+    ttl: 30m                # 条目存活时间
+    max-size: 1000          # 最大条目数，超出按最近访问时间淘汰
+
+  conversation:
+    enabled: true
+    rewrite-enabled: true   # 是否用 LLM 把带指代的追问改写成独立问题
+    max-history-turns: 6    # 参与改写的最近对话轮数（1 轮 = 1 问 + 1 答）
+
+logging:
+  level:
+    com.hospital.rag: INFO

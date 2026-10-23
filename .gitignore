@@ -1,0 +1,35 @@
+# ---- 构建产物 ----
+target/
+build/
+out/
+
+# ---- IDE ----
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.factorypath
+
+# ---- 日志 ----
+*.log
+logs/
+
+# ---- 本地配置 / 密钥（不要提交真实 key） ----
+.env
+application-local.yml
+application-local.yaml
+*-local.yml
+*-secret.yml
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 其他 ----
+*.tmp
+*.bak
