@@ -137,10 +137,17 @@ public class RagProperties {
     /** 多轮对话配置。 */
     @Data
     public static class Conversation {
+        /** 多轮对话总开关；关闭后退化为单轮问答，历史既不读也不写。 */
         private boolean enabled = true;
         /** 是否启用基于历史的问题改写。 */
         private boolean rewriteEnabled = true;
         /** 参与改写的最近对话轮数（1 轮 = 1 问 + 1 答）。 */
         private int maxHistoryTurns = 6;
+        /** 会话空闲存活时间，超过后历史自动失效。 */
+        private Duration sessionTtl = Duration.ofHours(2);
+        /** 最大并发会话数，超出后按最久未访问淘汰。 */
+        private int maxSessions = 10000;
+        /** 单会话保留的最大消息条数（1 轮 = 2 条），超出按轮淘汰最早的。 */
+        private int maxMessagesPerSession = 40;
     }
 }

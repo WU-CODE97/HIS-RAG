@@ -18,6 +18,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -26,7 +27,6 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -77,23 +77,54 @@ public class RagController {
     /**
      * 端到端问答，支持多轮。
      *
-     * <p>请求示例：</p>
+     * <p>多轮上下文由服务端按 {@code sessionId} 维护，<b>不需要也不接受客户端传 history</b>：
+     * 首次调用不传 {@code sessionId}，响应里会返回新建的会话 id，后续带上它即可延续对话。</p>
+     *
      * <pre>
-     * {
-     *   "query": "它的禁忌是什么？",
-     *   "user": { "userId": "D001", "departments": ["心内科"], "roles": ["DOCTOR"], "clearanceLevel": 1 },
-     *   "history": [
-     *     { "role": "user", "content": "高血压常用哪些药？" },
-     *     { "role": "assistant", "content": "常用 ACEI、ARB、CCB 等……" }
-     *   ]
-     * }
+     * // 第 1 轮
+     * { "query": "高血压常用哪些药？",
+     *   "user": { "userId": "D001", "departments": ["心内科"], "roles": ["DOCTOR"], "clearanceLevel": 1 } }
+     * → { "sessionId": "conv-8f1c...", "answer": "常用 ACEI、ARB、CCB 等……" }
+     *
+     * // 第 2 轮：只带 sessionId，上一轮问答由服务端提供
+     * { "query": "它的禁忌是什么？", "sessionId": "conv-8f1c...", "user": { "userId": "D001", ... } }
+     * → { "rewrittenQuery": "高血压常用药的禁忌症有哪些", ... }
      * </pre>
      */
     @PostMapping("/query")
     public ResponseEntity<RagAnswer> query(@RequestBody QueryRequest request) {
         UserContext user = request.user() == null ? UserContext.guest() : request.user();
-        List<ChatMessage> history = request.history() == null ? Collections.emptyList() : request.history();
-        return ResponseEntity.ok(ragService.query(request.query(), user, history));
+        return ResponseEntity.ok(ragService.query(request.query(), user, request.sessionId()));
+    }
+
+    /**
+     * 查看会话历史（调试 / 页面刷新后恢复用）。
+     *
+     * <p>{@code userId} 仅用于归属校验：会话历史可能含上一轮暴露的权限相关信息，
+     * 因此不属于该用户的会话一律拒绝。</p>
+     */
+    @GetMapping("/conversation/{sessionId}")
+    public ResponseEntity<Map<String, Object>> conversation(
+            @PathVariable("sessionId") String sessionId,
+            @RequestParam(value = "userId", required = false) String userId) {
+        List<ChatMessage> messages = ragService.history(sessionId, ownerContext(userId));
+        Map<String, Object> body = new HashMap<>();
+        body.put("sessionId", sessionId);
+        body.put("count", messages.size());
+        body.put("messages", messages);
+        return ResponseEntity.ok(body);
+    }
+
+    /** 清空会话历史（用户主动结束对话 / 退出登录时调用）。 */
+    @DeleteMapping("/conversation/{sessionId}")
+    public ResponseEntity<Map<String, Object>> clearConversation(
+            @PathVariable("sessionId") String sessionId,
+            @RequestParam(value = "userId", required = false) String userId) {
+        boolean cleared = ragService.clearConversation(sessionId, ownerContext(userId));
+        Map<String, Object> body = new HashMap<>();
+        body.put("sessionId", sessionId);
+        body.put("cleared", cleared);
+        return ResponseEntity.ok(body);
     }
 
     /**
@@ -170,6 +201,9 @@ public class RagController {
         body.put("bm25Documents", bm25Index.size());
         body.put("hybrid", hybridStats());
         body.put("cache", semanticCache.stats());
+        Map<String, Object> conversation = new HashMap<>();
+        conversation.put("sessions", ragService.conversationCount());
+        body.put("conversation", conversation);
         return ResponseEntity.ok(body);
     }
 
@@ -231,11 +265,18 @@ public class RagController {
     public record IngestRequest(List<Document> documents) {
     }
 
-    /** 问答 / 检索请求；{@code history} 仅问答使用。 */
-    public record QueryRequest(String query, UserContext user, List<ChatMessage> history, Integer topK) {
+    /** 问答 / 检索请求；会话上下文由 {@code sessionId} 指定，{@code history} 不再作为入参。 */
+    public record QueryRequest(String query, UserContext user, String sessionId, Integer topK) {
     }
 
     /** 评估请求。 */
     public record EvalRequest(List<Evaluator.EvalCase> cases, UserContext user, Integer topK) {
+    }
+
+    /** 仅用于会话归属校验的轻量用户上下文（历史查询接口不涉及检索权限）。 */
+    private static UserContext ownerContext(String userId) {
+        return UserContext.builder()
+                .userId(userId == null || userId.isBlank() ? "anonymous" : userId)
+                .build();
     }
 }

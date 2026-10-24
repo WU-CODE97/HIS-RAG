@@ -1,5 +1,6 @@
 package com.hospital.rag.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -28,6 +29,8 @@ public class ChatMessage {
         return new ChatMessage("assistant", content);
     }
 
+    /** 判断是否用户消息；加 {@code @JsonIgnore} 避免被序列化成多余的 {@code user} 字段。 */
+    @JsonIgnore
     public boolean isUser() {
         return "user".equalsIgnoreCase(role);
     }

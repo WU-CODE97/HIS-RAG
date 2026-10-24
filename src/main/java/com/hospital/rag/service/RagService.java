@@ -2,6 +2,7 @@ package com.hospital.rag.service;
 
 import com.hospital.rag.cache.SemanticCache;
 import com.hospital.rag.config.RagProperties;
+import com.hospital.rag.conversation.ConversationStore;
 import com.hospital.rag.generate.AnswerGenerator;
 import com.hospital.rag.ingest.DocumentIngestionService;
 import com.hospital.rag.model.AccessControl;
@@ -18,19 +19,25 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * RAG 编排服务。
  *
- * <p>主链路：多轮改写 → 语义缓存 → 混合检索 → 重排 → 生成 → 回填缓存。</p>
+ * <p>主链路：会话历史 → 多轮改写 → 语义缓存 → 混合检索 → 重排 → 生成 → 回填缓存 → 回写历史。</p>
+ *
+ * <p><b>多轮对话的上下文由服务端会话持有</b>：调用方只传 {@code sessionId}，
+ * 历史不进入请求体，既避免客户端伪造上下文，也避免每轮重复传输整段对话。</p>
  */
 @Service
 public class RagService {
 
     private static final Logger log = LoggerFactory.getLogger(RagService.class);
+
+    /** 新建会话 id 的前缀，便于日志与排查时一眼识别。 */
+    private static final String SESSION_PREFIX = "conv-";
 
     private final DocumentIngestionService ingestionService;
     private final Retriever retriever;
@@ -38,6 +45,7 @@ public class RagService {
     private final AnswerGenerator answerGenerator;
     private final QueryRewriter queryRewriter;
     private final SemanticCache semanticCache;
+    private final ConversationStore conversationStore;
     private final RagProperties.Retrieval retrievalConfig;
 
     public RagService(DocumentIngestionService ingestionService,
@@ -46,6 +54,7 @@ public class RagService {
                       AnswerGenerator answerGenerator,
                       QueryRewriter queryRewriter,
                       SemanticCache semanticCache,
+                      ConversationStore conversationStore,
                       RagProperties properties) {
         this.ingestionService = ingestionService;
         this.retriever = retriever;
@@ -53,6 +62,7 @@ public class RagService {
         this.answerGenerator = answerGenerator;
         this.queryRewriter = queryRewriter;
         this.semanticCache = semanticCache;
+        this.conversationStore = conversationStore;
         this.retrievalConfig = properties.getRetrieval();
     }
 
@@ -92,42 +102,50 @@ public class RagService {
         return chunks;
     }
 
-    /** 单轮问答。 */
+    /** 单轮问答（不延续上下文，服务端为其分配一个一次性会话）。 */
     public RagAnswer query(String query, UserContext user) {
-        return query(query, user, Collections.emptyList());
+        return query(query, user, null);
     }
 
     /**
-     * 多轮问答。
+     * 多轮问答。历史从服务端会话中取，<b>不接受调用方传入</b>。
      *
-     * @param query   用户本轮问题
-     * @param user    用户上下文（权限过滤 + 缓存权限域）
-     * @param history 历史对话（时间正序，不含本轮）
-     * @return 带引用、耗时与缓存标记的答案
+     * @param query     用户本轮问题
+     * @param user      用户上下文（权限过滤 + 缓存权限域 + 会话归属校验）
+     * @param sessionId 会话 id；为空时创建新会话
+     * @return 带引用、耗时、缓存标记与会话 id 的答案
+     * @throws com.hospital.rag.conversation.ConversationAccessException 会话不属于当前用户
      */
-    public RagAnswer query(String query, UserContext user, List<ChatMessage> history) {
+    public RagAnswer query(String query, UserContext user, String sessionId) {
         long start = System.currentTimeMillis();
         UserContext effectiveUser = user == null ? UserContext.guest() : user;
+        String session = (sessionId == null || sessionId.isBlank()) ? newSessionId() : sessionId;
 
-        // 1. 多轮改写：把带指代的追问补全为独立问题
+        // 1. 取历史：由会话存储按 sessionId 提供，越权访问会直接抛异常
+        List<ChatMessage> history = conversationStore.history(session, effectiveUser);
+
+        // 2. 多轮改写：把带指代的追问补全为独立问题
         String effectiveQuery = queryRewriter.rewrite(query, history);
 
-        // 2. 语义缓存：命中则直接返回，跳过检索与生成
+        // 3. 语义缓存：命中则直接返回，跳过检索与生成
         Optional<RagAnswer> cached = semanticCache.get(effectiveQuery, effectiveUser);
         if (cached.isPresent()) {
             RagAnswer hit = cached.get();
+            hit.setSessionId(session);
             hit.setCacheHit(true);
             hit.setRewrittenQuery(effectiveQuery);
             hit.setLatencyMs(System.currentTimeMillis() - start);
-            log.info("问答命中缓存: query='{}', 耗时={}ms", effectiveQuery, hit.getLatencyMs());
+            // 缓存命中同样要落历史，否则下一轮改写会丢失这一轮上下文
+            recordTurn(session, effectiveUser, query, hit);
+            log.info("问答命中缓存: session={}, query='{}', 耗时={}ms", session, effectiveQuery, hit.getLatencyMs());
             return hit;
         }
 
-        // 3. 混合召回
+        // 4. 混合召回
         int candidateK = Math.max(retrievalConfig.getCandidateTopK(), retrievalConfig.getFinalTopK());
         List<ScoredChunk> candidates = retriever.retrieve(effectiveQuery, effectiveUser, candidateK);
 
-        // 4. 重排
+        // 5. 重排
         List<ScoredChunk> contexts;
         if (retrievalConfig.isEnableRerank() && !candidates.isEmpty()) {
             contexts = reranker.rerank(effectiveQuery, candidates, retrievalConfig.getFinalTopK());
@@ -135,26 +153,67 @@ public class RagService {
             contexts = new ArrayList<>(candidates.subList(0, Math.min(retrievalConfig.getFinalTopK(), candidates.size())));
         }
 
-        // 5. 生成（用改写后的问题做检索与生成，但对外保留用户原问题）
+        // 6. 生成（用改写后的问题做检索与生成，但对外保留用户原问题）
         RagAnswer answer = answerGenerator.generate(effectiveQuery, contexts);
+        answer.setSessionId(session);
         answer.setQuery(query);
         answer.setRewrittenQuery(effectiveQuery);
         answer.setCacheHit(false);
         answer.setLatencyMs(System.currentTimeMillis() - start);
 
-        // 6. 回填缓存（仅成功结果）
+        // 7. 回填缓存（仅成功结果）
         if (!answer.isError()) {
             semanticCache.put(effectiveQuery, effectiveUser, answer);
         }
 
-        log.info("问答完成: query='{}', 改写后='{}', 召回={}, 上下文={}, 耗时={}ms",
-                query, effectiveQuery, candidates.size(), contexts.size(), answer.getLatencyMs());
+        // 8. 回写历史（失败的轮次不记录，避免把错误提示带入下一轮改写）
+        recordTurn(session, effectiveUser, query, answer);
+
+        log.info("问答完成: session={}, query='{}', 改写后='{}', 历史={}, 召回={}, 上下文={}, 耗时={}ms",
+                session, query, effectiveQuery, history.size(), candidates.size(), contexts.size(), answer.getLatencyMs());
         return answer;
+    }
+
+    /** 读取会话历史（供调试接口使用，同样受归属校验约束）。 */
+    public List<ChatMessage> history(String sessionId, UserContext user) {
+        return conversationStore.history(sessionId, user);
+    }
+
+    /** 清空会话历史。 */
+    public boolean clearConversation(String sessionId, UserContext user) {
+        return conversationStore.clear(sessionId, user);
+    }
+
+    /** 当前存活会话数。 */
+    public int conversationCount() {
+        return conversationStore.sessionCount();
     }
 
     /** 仅检索不生成，便于调试与评估。 */
     public List<ScoredChunk> retrieveOnly(String query, UserContext user, int topK) {
         UserContext effectiveUser = user == null ? UserContext.guest() : user;
         return retriever.retrieve(query, effectiveUser, topK);
+    }
+
+    /** 生成一个新的会话 id。 */
+    private String newSessionId() {
+        return SESSION_PREFIX + UUID.randomUUID();
+    }
+
+    /**
+     * 记录一轮问答到会话。
+     *
+     * <p>历史上写失败不应影响本次回答，因此只记日志、不向上抛。
+     * 生成失败的轮次同样跳过——把错误提示写进历史会污染下一轮的改写。</p>
+     */
+    private void recordTurn(String sessionId, UserContext user, String query, RagAnswer answer) {
+        if (answer == null || answer.isError()) {
+            return;
+        }
+        try {
+            conversationStore.append(sessionId, user, query, answer.getAnswer());
+        } catch (Exception e) {
+            log.warn("会话历史写入失败: session={}, 原因={}", sessionId, e.getMessage());
+        }
     }
 }

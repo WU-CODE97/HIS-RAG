@@ -17,6 +17,9 @@ import java.util.List;
 @AllArgsConstructor
 public class RagAnswer {
 
+    /** 本轮所属会话 id（调用方下次携带它即可延续上下文）。 */
+    private String sessionId;
+
     /** 用户原始问题。 */
     private String query;
 

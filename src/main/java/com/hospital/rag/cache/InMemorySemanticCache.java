@@ -195,6 +195,7 @@ public class InMemorySemanticCache implements SemanticCache {
     /** 深拷贝，避免调用方修改污染缓存内容。 */
     private RagAnswer copyOf(RagAnswer src) {
         return RagAnswer.builder()
+                .sessionId(src.getSessionId())
                 .query(src.getQuery())
                 .answer(src.getAnswer())
                 .citations(src.getCitations() == null ? new ArrayList<>() : new ArrayList<>(src.getCitations()))

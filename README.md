@@ -6,12 +6,12 @@
 
 ## 特性
 
-- **文档解析入库**：支持 PDF（Apache PDFBox）与纯文本（txt / md / csv），自动识别文件类型，切片时按句末标点断句并保留重叠。
+- **文档解析入库**：支持 PDF（Apache PDFBox）、DOCX（Apache POI，**含表格**）与纯文本（txt / md / csv），自动识别文件类型，切片时按句末标点断句并保留重叠。
 - **混合检索**：向量语义召回 + BM25 关键词召回。支持两种形态——**ES 原生混合检索**（文本与向量同索引，一次查询内完成召回与融合）与**本地两路召回 + Java 融合**（RRF / 加权归一化）。
 - **可插拔存储后端**：混合检索支持 `local` / `elasticsearch`，BM25 支持 `memory` / `elasticsearch`，向量库支持 `memory` / `pgvector`，通过配置切换，**外部服务不可用时不阻断应用启动**。
 - **LLM 重排**：对召回候选做 listwise 重排，解析失败自动降级为原始顺序。
 - **语义缓存**：按查询向量余弦相似度命中，**按权限域隔离**，避免高权限答案泄漏。
-- **多轮对话**：结合历史把带指代的追问改写为独立问题，任何异常都回退原问题。
+- **多轮对话**：历史由服务端按 `sessionId` 维护（**不通过入参传入**），结合历史把带指代的追问改写为独立问题，任何异常都回退原问题。
 - **隐私脱敏**：对身份证号、银行卡号、手机号、固话、邮箱做正则脱敏。
 - **权限控制**：文档级 ACL（科室 / 角色 / 密级 / 公开），检索阶段统一过滤。
 - **检索评估**：内置 Recall@K、Precision@K、MRR 指标。
@@ -24,9 +24,10 @@
 
 ```mermaid
 flowchart LR
-    A[用户提问] --> B[多轮改写 QueryRewriter]
+    A[用户提问 + sessionId] --> A1[取会话历史<br/>ConversationStore]
+    A1 --> B[多轮改写 QueryRewriter]
     B --> C{语义缓存命中?}
-    C -->|是| Z[返回答案]
+    C -->|是| J
     C -->|否| D[混合检索 HybridRetriever]
     D -->|hybrid=local| D1[向量检索 VectorRetriever]
     D -->|hybrid=local| D2[BM25 检索 Bm25Retriever]
@@ -39,7 +40,8 @@ flowchart LR
     F --> G[答案生成 AnswerGenerator]
     G --> H[PII 脱敏 PiiMasker]
     H --> I[回填语义缓存]
-    I --> Z
+    I --> J[回写当前轮次到会话]
+    J --> Z[返回答案]
 ```
 
 > 两条路径最终都汇入同一个 `Retriever` 接口，`RagService` 无需感知后端差异。
@@ -50,7 +52,7 @@ flowchart LR
 | 组件 | 选型 |
 |---|---|
 | 框架 | Spring Boot 3.2.5 / Java 17 |
-| 文档解析 | Apache PDFBox 2.0.37 |
+| 文档解析 | Apache PDFBox 2.0.37（PDF）/ Apache POI 5.2.5（DOCX） |
 | 混合检索 | ES 原生（`dense_vector` + `rank.rrf`）/ 本地两路召回 + Java 融合 |
 | 向量库 | 内存（默认）/ PostgreSQL + pgvector |
 | 关键词检索 | 内存倒排（默认）/ Elasticsearch 8.x |
@@ -77,9 +79,11 @@ mvn clean package -DskipTests
 
 ### 零外部依赖启动
 
-默认使用内存版向量库与 BM25 索引，**无需任何中间件**即可跑通全链路：
+仓库默认 `rag.hybrid.backend=elasticsearch`（需要本地 ES）。若想完全零依赖跑通全链路，
+把混合检索切回本地模式即可——内存向量库 + 内存 BM25 索引，**不需要任何中间件**：
 
 ```bash
+export RAG_HYBRID_BACKEND=local
 export RAG_EMBEDDING_API_KEY=sk-xxx
 export RAG_LLM_API_KEY=sk-xxx
 mvn spring-boot:run
@@ -176,7 +180,7 @@ mvn spring-boot:run
 | `rag.embedding.base-url` | `https://api.openai.com/v1` | Embedding 接口地址（`RAG_EMBEDDING_BASE_URL`） |
 | `rag.embedding.api-key` | 空 | （`RAG_EMBEDDING_API_KEY`） |
 | `rag.embedding.model` | `text-embedding-3-small` | （`RAG_EMBEDDING_MODEL`） |
-| `rag.embedding.dimension` | `1536` | 需与向量库维度一致 |
+| `rag.embedding.dimension` | `1024` | 必须与模型实际输出维度一致 |
 | `rag.embedding.batch-size` | `16` | 批量向量化条数 |
 | `rag.llm.base-url` | `https://api.openai.com/v1` | Chat 接口地址（`RAG_LLM_BASE_URL`） |
 | `rag.llm.api-key` | 空 | （`RAG_LLM_API_KEY`） |
@@ -193,7 +197,7 @@ mvn spring-boot:run
 | `rag.bm25.analyzer` | `standard` | 建议 IK 装好后改 `ik_max_word`（`RAG_BM25_ANALYZER`） |
 | `rag.vector.backend` | `memory` | `memory` / `pgvector`（`RAG_VECTOR_BACKEND`） |
 | `rag.vector.table` | `his_rag_chunks` | pgvector 表名（`RAG_VECTOR_TABLE`） |
-| `rag.vector.dimension` | `1536` | 必须与 embedding 维度一致（`RAG_VECTOR_DIMENSION`） |
+| `rag.vector.dimension` | `1024` | 必须与 embedding 维度一致（`RAG_VECTOR_DIMENSION`） |
 | `rag.vector.index-type` | `hnsw` | `hnsw` / `ivfflat` / `none`（`RAG_VECTOR_INDEX`） |
 | `spring.elasticsearch.uris` | `http://localhost:9200` | （`ES_URIS`） |
 | `spring.datasource.url` | `jdbc:postgresql://localhost:5432/his_rag` | （`PG_URL`） |
@@ -204,11 +208,11 @@ mvn spring-boot:run
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `rag.hybrid.backend` | `local` | `local` / `elasticsearch`（`RAG_HYBRID_BACKEND`） |
+| `rag.hybrid.backend` | `elasticsearch` | `local` / `elasticsearch`（`RAG_HYBRID_BACKEND`） |
 | `rag.hybrid.index-name` | `his_rag_hybrid` | ES 索引名（`RAG_HYBRID_INDEX`） |
-| `rag.hybrid.dimension` | `1536` | 必须与 embedding 维度一致（`RAG_HYBRID_DIMENSION`） |
+| `rag.hybrid.dimension` | `1024` | 必须与 embedding 维度一致（`RAG_HYBRID_DIMENSION`） |
 | `rag.hybrid.analyzer` | `standard` | 建议 IK 装好后改 `ik_max_word`（`RAG_HYBRID_ANALYZER`） |
-| `rag.hybrid.fusion` | `rrf` | `rrf`=ES 原生 RRF（需 8.8+）；`knn`=两路 `_score` 加权求和（`RAG_HYBRID_FUSION`） |
+| `rag.hybrid.fusion` | `knn` | `knn`=两路 `_score` 加权求和；`rrf`=ES 原生 RRF（需 8.8+ **且 Platinum/Enterprise 授权**）（`RAG_HYBRID_FUSION`） |
 | `rag.hybrid.knn-k` | `100` | kNN 每分片返回的候选数 |
 | `rag.hybrid.num-candidates` | `200` | kNN 每分片探索的候选数，需 ≥ `knn-k` |
 | `rag.hybrid.rank-constant` | `60` | RRF 平滑常数 |
@@ -244,9 +248,12 @@ mvn spring-boot:run
 | `rag.cache.similarity-threshold` | `0.95` | 命中阈值（余弦相似度） |
 | `rag.cache.ttl` | `30m` | 条目存活时间 |
 | `rag.cache.max-size` | `1000` | 最大条目数，超出按最近访问淘汰 |
-| `rag.conversation.enabled` | `true` | 多轮对话开关 |
+| `rag.conversation.enabled` | `true` | 多轮对话开关，关闭后退化为单轮 |
 | `rag.conversation.rewrite-enabled` | `true` | 是否启用查询改写 |
 | `rag.conversation.max-history-turns` | `6` | 参与改写的最近对话轮数 |
+| `rag.conversation.session-ttl` | `2h` | 会话空闲存活时间，超时后历史自动失效 |
+| `rag.conversation.max-sessions` | `10000` | 最大并发会话数，超出按最久未访问淘汰 |
+| `rag.conversation.max-messages-per-session` | `40` | 单会话保留的最大消息条数（1 轮 = 2 条），按轮淘汰最早的 |
 | `spring.servlet.multipart.max-file-size` | `50MB` | 单文件上传上限 |
 
 ---
@@ -258,10 +265,12 @@ mvn spring-boot:run
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/ingest` | JSON 批量入库（已解析的纯文本） |
-| `POST` | `/ingest/file` | 上传 PDF / 纯文本文件入库（multipart） |
-| `POST` | `/query` | 问答，支持多轮 `history` |
+| `POST` | `/ingest/file` | 上传 PDF / DOCX / 纯文本文件入库（multipart） |
+| `POST` | `/query` | 问答；多轮只需回传 `sessionId` |
 | `POST` | `/retrieve` | 仅检索，便于调试 |
 | `POST` | `/eval` | 检索效果评估 |
+| `GET` | `/conversation/{sessionId}` | 查看会话历史（调试 / 页面刷新后恢复） |
+| `DELETE` | `/conversation/{sessionId}` | 清空会话历史 |
 | `GET` | `/stats` | 知识库与缓存统计 |
 | `GET` | `/cache/stats` | 语义缓存统计 |
 | `DELETE` | `/cache` | 清空语义缓存 |
@@ -316,29 +325,38 @@ curl -X POST http://localhost:8080/api/rag/ingest \
 
 ### 3. 多轮问答
 
+**历史由服务端维护，不通过请求体传入。** 首轮不传 `sessionId`，响应会返回新建的会话 id；后续轮次只带上它。
+
 ```bash
+# 第 1 轮：不传 sessionId，服务端新建会话
 curl -X POST http://localhost:8080/api/rag/query \
   -H 'Content-Type: application/json' \
   -d '{
-    "query": "它的禁忌是什么？",
+    "query": "高血压常用哪些药？",
     "user": {
       "userId": "D001",
       "name": "张三",
       "departments": ["心内科"],
       "roles": ["DOCTOR"],
       "clearanceLevel": 1
-    },
-    "history": [
-      { "role": "user", "content": "高血压常用哪些药？" },
-      { "role": "assistant", "content": "常用 ACEI、ARB、CCB 等。" }
-    ]
+    }
+  }'
+
+# 第 2 轮：只回传 sessionId，上一轮问答由服务端提供
+curl -X POST http://localhost:8080/api/rag/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "它的禁忌是什么？",
+    "sessionId": "conv-3f7b1c2e-...",
+    "user": { "userId": "D001", "departments": ["心内科"], "roles": ["DOCTOR"], "clearanceLevel": 1 }
   }'
 ```
 
-响应：
+响应（第 2 轮）：
 
 ```json
 {
+  "sessionId": "conv-3f7b1c2e-...",
   "query": "它的禁忌是什么？",
   "rewrittenQuery": "高血压常用药的禁忌症有哪些",
   "answer": "ACEI 类药物在妊娠期禁用…… [1]",
@@ -361,9 +379,22 @@ curl -X POST http://localhost:8080/api/rag/query \
 
 字段说明：
 
+- `sessionId`：本轮所属会话，下一轮带上它即可延续上下文；
 - `rewrittenQuery`：多轮改写后实际用于检索的问题（未改写时与 `query` 相同）；
-- `cacheHit`：是否命中语义缓存（命中时不调用检索与生成）；
-- `error`：生成是否失败（失败结果不会写入缓存）。
+- `cacheHit`：是否命中语义缓存（命中时不调用检索与生成，但**同样会写入历史**）；
+- `error`：生成是否失败（失败结果不会写入缓存，也**不会写入历史**）。
+
+会话维护：
+
+```bash
+# 查看会话历史（userId 用于归属校验）
+curl "http://localhost:8080/api/rag/conversation/conv-3f7b1c2e-...?userId=D001"
+
+# 结束会话
+curl -X DELETE "http://localhost:8080/api/rag/conversation/conv-3f7b1c2e-...?userId=D001"
+```
+
+> 携带他人 `sessionId` 会返回 **403**，而不是静默返回空历史——历史里可能残留上一轮暴露的科室、密级信息。
 
 ### 4. 检索评估
 
@@ -450,6 +481,8 @@ curl http://localhost:8080/api/rag/stats
 - **两路天然对齐**：同一份 ACL、同一份切片，不存在两套存储的写入时序差异。
 
 `fusion=rrf` 走 ES 8.8+ 的 `rank.rrf`，按排名倒数融合，对两路分数量纲不敏感；
+> ⚠️ RRF 是 **付费特性**。Basic 授权下会报 `security_exception: current license is non-compliant for [Reciprocal Rank Fusion (RRF)]`，此时请用 `fusion=knn`。
+
 `fusion=knn` 则不传 `rank`，由 ES 把 `query` 与 `knn` 两路 `_score` 加权求和，权重由 `text-boost` / `knn-boost` 控制。
 
 #### 形态二：本地两路召回 + Java 融合（默认）
@@ -472,6 +505,35 @@ lvl{密级}|d:{排序科室}|r:{排序角色}      → 普通用户按权限签�
 
 **不同权限域即使问题完全相同也不共享缓存**。命中时返回深拷贝，避免调用方修改污染缓存。文档入库或清库会自动失效全部缓存。
 
+### 多轮会话管理
+
+多轮上下文**由服务端持有**，请求体只带 `sessionId`：
+
+```
+POST /query { "query": "...", "sessionId": "conv-xxx" }   ← 历史不进来
+     │
+     ├─ ConversationStore.history(sessionId, user)   ← 归属校验 + 取最近 N 轮
+     ├─ QueryRewriter.rewrite(query, history)        ← 指代补全
+     └─ ConversationStore.append(...)                ← 本轮问答回写
+```
+
+为什么不让客户端传 `history`：
+
+| 风险 | 客户端传 history | 服务端会话 |
+|---|---|---|
+| 历史可被篡改（提示注入、伪造助理答复） | 有 | 无 |
+| 越权上下文（低权限用户塞入高密级结论诱导回答） | 有 | 无 |
+| 每轮请求体积随轮次线性增长 | 有 | O(1) |
+| 服务端可审计、可主动失效 | 无 | 有 |
+
+实现要点：
+
+- **归属校验**：会话与创建者 `userId` 绑定。`sessionId` 只用来定位，不当作访问凭据——他人携带同一 id 访问会被拒绝（403）。
+- **双重淘汰**：空闲 TTL（默认 2h）+ 会话数上限（默认 10000，LRU 淘汰），避免长期运行后内存无界增长。
+- **按轮裁剪**：单会话超过 `max-messages-per-session` 时按「轮」淘汰最早的，保证 `user` / `assistant` 始终成对，改写时不会出现孤立消息。
+- **失败不落历史**：`error=true` 的轮次不写入，避免把错误提示带进下一轮改写；命中缓存则必须写入，否则上下文会断。
+- **关闭开关即退化**：`rag.conversation.enabled=false` 时历史既不读也不写，等价于单轮问答。
+
 ### 降级策略
 
 | 环节 | 失败时行为 |
@@ -482,6 +544,8 @@ lvl{密级}|d:{排序科室}|r:{排序角色}      → 普通用户按权限签�
 | Embedding 调用 | 抛异常；语义缓存侧则跳过缓存 |
 | LLM 重排 | 回退为召回原始顺序 |
 | 查询改写 | 回退为用户原始问题 |
+| 会话历史读取 | 不存在 / 已过期按「无历史」处理；归属不符返回 403 |
+| 会话历史写入 | 记录 warn 日志，不影响本次回答 |
 | 答案生成 | 返回错误提示，`error=true`，结果不写缓存 |
 
 设计原则：**任何外部依赖不可用都不应导致应用无法启动**。
@@ -506,27 +570,32 @@ his-rag/
     │   │   ├── store/            ChunkStore / VectorStore
     │   │   │                     InMemoryVectorStore / PgVectorStore
     │   │   ├── ingest/           DocumentParser / PdfDocumentParser
-    │   │   │                     PlainTextDocumentParser
+    │   │   │                     DocxDocumentParser / PlainTextDocumentParser
     │   │   │                     TextSplitter / DocumentIngestionService
     │   │   ├── retrieve/         Bm25Index / InMemoryBm25Index / ElasticsearchBm25Index
     │   │   │                     HybridSearchIndex / ElasticsearchHybridIndex
     │   │   │                     Retriever / VectorRetriever / Bm25Retriever
     │   │   │                     HybridRetriever / Reranker / LlmReranker
     │   │   ├── cache/            SemanticCache / InMemorySemanticCache
+    │   │   ├── conversation/     ConversationStore / InMemoryConversationStore
+    │   │   │                     ConversationAccessException
     │   │   ├── rewrite/          QueryRewriter / LlmQueryRewriter
     │   │   ├── security/PiiMasker.java
     │   │   ├── generate/AnswerGenerator.java
     │   │   ├── service/RagService.java
     │   │   ├── eval/Evaluator.java
-    │   │   └── controller/RagController.java
+    │   │   └── controller/       RagController / ApiExceptionHandler
     │   └── resources/application.yml
     └── test/java/com/hospital/rag/
         ├── cache/InMemorySemanticCacheTest.java
+        ├── conversation/InMemoryConversationStoreTest.java
         ├── ingest/DocumentIngestionServiceTest.java
+        ├── ingest/DocxDocumentParserTest.java
         ├── ingest/PdfDocumentParserTest.java
         ├── ingest/PlainTextDocumentParserTest.java
         ├── retrieve/HybridRetrieverTest.java
-        └── rewrite/LlmQueryRewriterTest.java
+        ├── rewrite/LlmQueryRewriterTest.java
+        └── service/RagServiceConversationTest.java
 ```
 
 ---
@@ -537,12 +606,15 @@ his-rag/
 mvn test
 ```
 
-当前共 **33 个单元测试**，全部不依赖外部服务：
+当前共 **59 个单元测试**，全部不依赖外部服务：
 
 | 测试类 | 覆盖内容 |
 |---|---|
 | `InMemorySemanticCacheTest` | 相似命中、语义无关不命中、**跨科室/跨密级/管理员不泄漏**、失败结果不缓存、副本隔离、TTL/统计 |
+| `InMemoryConversationStoreTest` | 历史读写顺序、**跨用户读写/清空一律拒绝**、副本隔离、按轮裁剪、TTL 过期、LRU 淘汰、开关关闭 |
+| `RagServiceConversationTest` | 会话自动分配、**历史来自服务端而非入参**、会话隔离、越权拒绝、**缓存命中仍写历史**、失败轮次不写历史、关闭后退化单轮 |
 | `LlmQueryRewriterTest` | 无历史跳过、正常改写、引号清理、多行截断、异常/空/超长回退 |
+| `DocxDocumentParserTest` | 后缀识别、段落抽取、**表格抽取（单元格用竖线分隔）**、段落与表格按原文顺序保留、空文档、空白归一化 |
 | `PdfDocumentParserTest` | 现场生成 PDF 再抽取、多页、无文本层、空白归一化 |
 | `PlainTextDocumentParserTest` | 后缀识别、无后缀兜底、UTF-8 中文 |
 | `HybridRetrieverTest` | **有混合索引时走 ES 路径且不碰本地索引**、ES 结果按 ACL 过滤、无索引时回退本地融合、空查询短路 |
@@ -554,7 +626,10 @@ mvn test
 
 - **扫描件 PDF 不支持**：PDFBox 只能提取文本层，纯图片 PDF 需要 OCR（如 Tesseract）预处理。
 - **语义缓存为单机内存实现**：多实例部署时各自独立，需替换为 Redis 等共享存储。
-- **ES 原生 RRF 需要 8.8+**：低版本只能用 `fusion=knn`（分数加权求和），或回退 `rag.hybrid.backend=local`。
+- **会话存储为单机内存实现**：同一会话无法跨实例延续，需要共享上下文时把 `ConversationStore` 换成 Redis 实现（接口不变）。
+- **匿名会话的隔离依赖 sessionId 不可猜测**：匿名用户 `userId` 相同，归属校验退化为 UUID 校验；生产环境应先完成认证再进入问答。
+- **ES 原生 RRF 需要 8.8+ 且为付费授权**：Basic 授权下只能用 `fusion=knn`（分数加权求和），或回退 `rag.hybrid.backend=local`。
+- **`dense_vector` 维度必须与模型输出一致**：例如 `qwen3-text-embedding` 输出 1024 维，配置成 1536 会被 ES 拒写；本地内存向量库不校验维度，问题更隐蔽。入库时已做前置校验并直接报错。
 - **ES 混合模式下 ES 是硬依赖**：查询失败只会得到空候选，不会自动回退到本地索引（本地索引在该模式下为空）。若需要容灾，请保持 `rag.hybrid.backend=local` 并使用 pgvector + ES BM25。
 - **权限过滤在 Java 侧完成**：数据量大时可下推到 ES `bool` 查询或 SQL `WHERE`，减少无效回传。ES 混合模式同样如此，因此会先扩大候选窗口再过滤。
 - **`dense_vector` 维度不可变**：切换 embedding 模型后必须重建索引。
@@ -562,8 +637,10 @@ mvn test
 
 ## Roadmap
 
-- [ ] docx / xlsx 文档解析
+- [x] docx 文档解析（段落 + 表格，基于 Apache POI）
+- [ ] xlsx / pptx 文档解析
 - [ ] 扫描件 OCR 兜底链路
 - [ ] 语义缓存 Redis 实现（多实例共享）
+- [ ] 会话存储 Redis 实现（多实例共享、支持跨实例续聊）
 - [ ] Testcontainers 端到端集成测试
 - [ ] 检索结果去重与多样性控制（MMR）

@@ -107,6 +107,7 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
         if (chunks == null || chunks.isEmpty() || embeddings == null || embeddings.isEmpty()) {
             return;
         }
+        assertDimension(embeddings);
         List<Chunk> chunkList = new ArrayList<>(chunks);
         int n = Math.min(chunkList.size(), embeddings.size());
         try {
@@ -121,15 +122,46 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
             }
             BulkResponse response = client.bulk(builder.build());
             if (response.errors()) {
+                String reason = response.items().stream()
+                        .filter(item -> item.error() != null)
+                        .findFirst()
+                        .map(item -> item.error().reason())
+                        .orElse("unknown");
                 response.items().stream()
                         .filter(item -> item.error() != null)
                         .limit(5)
                         .forEach(item -> log.warn("混合索引部分文档写入失败: {}", item.error().reason()));
+                // 写入失败必须让调用方感知：静默返回成功会让知识库看起来有数据、实际检索为空
+                throw new IllegalStateException("混合索引写入失败: " + reason);
             }
             client.indices().refresh(r -> r.index(indexName));
             log.info("混合索引写入完成: {} 条", n);
+        } catch (IllegalStateException e) {
+            throw e;
         } catch (Exception e) {
             log.error("混合索引批量写入失败: {}", e.getMessage(), e);
+            throw new IllegalStateException("混合索引批量写入失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 写入前校验向量维度。
+     *
+     * <p>{@code dense_vector.dims} 在索引创建时固定，模型换过之后维度对不上会被 ES 拒写。
+     * 本地内存向量库不校验维度，因此这里做一次前置检查，把「静默失败」变成明确报错。</p>
+     */
+    private void assertDimension(List<float[]> embeddings) {
+        for (float[] vector : embeddings) {
+            if (vector == null) {
+                continue;
+            }
+            if (vector.length != config.getDimension()) {
+                throw new IllegalStateException(
+                        "embedding 维度与索引不一致：模型输出 " + vector.length
+                                + " 维，但 rag.hybrid.dimension=" + config.getDimension()
+                                + "。请修正配置并删除索引 " + indexName + " 后重启以重建");
+            }
+            return;
         }
     }
 
