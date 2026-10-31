@@ -6,10 +6,13 @@
 
 ## 特性
 
-- **文档解析入库**：支持 PDF（Apache PDFBox）、DOCX（Apache POI，**含表格**）与纯文本（txt / md / csv），自动识别文件类型，切片时按句末标点断句并保留重叠。
+- **文档解析入库**：支持 PDF（Apache PDFBox）、DOCX（Apache POI，**含表格与标题层级**）与纯文本（txt / md / csv），自动识别文件类型。
+- **结构化切片**：按标题层级切分、不跨章节；表格按行切并在每片重复表头，表头不会与表体分离；每片附带「文档 + 章节」上下文头，切片自带出处。
 - **混合检索**：向量语义召回 + BM25 关键词召回。支持两种形态——**ES 原生混合检索**（文本与向量同索引，一次查询内完成召回与融合）与**本地两路召回 + Java 融合**（RRF / 加权归一化）。
 - **可插拔存储后端**：混合检索支持 `local` / `elasticsearch`，BM25 支持 `memory` / `elasticsearch`，向量库支持 `memory` / `pgvector`，通过配置切换，**外部服务不可用时不阻断应用启动**。
-- **LLM 重排**：对召回候选做 listwise 重排，解析失败自动降级为原始顺序。
+- **重排**：默认走专用 cross-encoder 接口（DashScope `gte-rerank-v2`，30 条候选约 450ms），
+  可选 LLM 列表式重排或关闭；接口超时 / 异常自动回退为召回顺序，不阻断问答。
+- **上下文补全**：重排结果只作锚点，按文档顺序补齐**同一章节内**的相邻片段，兜住「一节长于一片」的情况，不跨节引入噪声。
 - **语义缓存**：按查询向量余弦相似度命中，**按权限域隔离**，避免高权限答案泄漏。
 - **多轮对话**：历史由服务端按 `sessionId` 维护（**不通过入参传入**），结合历史把带指代的追问改写为独立问题，任何异常都回退原问题。
 - **隐私脱敏**：对身份证号、银行卡号、手机号、固话、邮箱做正则脱敏。
@@ -35,10 +38,10 @@ flowchart LR
     D2 --> E
     D -->|hybrid=elasticsearch| D3[ES 单次查询 query + knn + rank.rrf]
     D3 --> E2[ES 协调节点融合]
-    E --> F[LLM 重排 LlmReranker]
+    E --> F[重排 Reranker<br/>cross-encoder / LLM]
     E2 --> F
-    F --> G[答案生成 AnswerGenerator]
-    G --> H[PII 脱敏 PiiMasker]
+    F --> G[答案生成 AnswerGenerator<br/>支持 SSE 流式]
+    G --> H[PII 脱敏 PiiMasker<br/>流式按句切分+尾部窗口]
     H --> I[回填语义缓存]
     I --> J[回写当前轮次到会话]
     J --> Z[返回答案]
@@ -187,6 +190,15 @@ mvn spring-boot:run
 | `rag.llm.model` | `gpt-4o-mini` | （`RAG_LLM_MODEL`） |
 | `rag.llm.temperature` | `0.2` | 采样温度 |
 | `rag.llm.max-tokens` | `1024` | 最大输出长度 |
+| `rag.llm.connect-timeout-ms` | `10000` | 连接超时 |
+| `rag.llm.read-timeout-ms` | `120000` | 非流式调用的读超时 |
+| `rag.llm.stream-timeout-ms` | `180000` | 流式调用的整体超时 |
+| `rag.llm.extra-body` | `{enable_thinking: false}` | 原样透传到上游请求体的私有参数 |
+
+> **`extra-body` 是这次性能治理的关键**：Qwen / 通义系列默认开启思维链，单次调用会先生成
+> 3000~5000 token 的推理内容（业务只需要几十到几百字）。实测关闭后重排 49.2s → 1.1s、
+> 生成 42.5s → 5.9s、改写 45.5s → 1.7s。做成透传而非硬编码，是为了换厂商时只改配置。
+> 若换成不支持该字段的厂商，删掉这一项即可（部分厂商会对未知字段返回 400）。
 
 ### 存储后端
 
@@ -229,15 +241,19 @@ mvn spring-boot:run
 |---|---|---|
 | `rag.retrieval.vector-top-k` | `20` | 向量召回候选数 |
 | `rag.retrieval.bm25-top-k` | `20` | BM25 召回候选数 |
-| `rag.retrieval.candidate-top-k` | `30` | 送入重排的候选数 |
-| `rag.retrieval.final-top-k` | `5` | 最终进入生成上下文的片段数 |
+| `rag.retrieval.candidate-top-k` | `30` | 送入重排的候选数（重排再准，也不该先砍召回） |
+| `rag.retrieval.final-top-k` | `5` | 重排后保留的锚点片段数 |
+| `rag.retrieval.neighbor-expand` | `1` | 锚点前后各补回几片相邻片段（`0`=关闭），只补同一章节内的片段 |
+| `rag.retrieval.max-context-chunks` | `12` | 进入生成上下文的片段数上限（含补回的相邻片段） |
 | `rag.retrieval.use-rrf` | `true` | `true`=RRF，`false`=加权归一化 |
 | `rag.retrieval.rrf-k` | `60` | RRF 平滑常数 |
 | `rag.retrieval.vector-weight` | `0.6` | 加权融合时向量权重 |
 | `rag.retrieval.bm25-weight` | `0.4` | 加权融合时 BM25 权重 |
-| `rag.retrieval.enable-rerank` | `true` | 是否启用 LLM 重排 |
+| `rag.retrieval.enable-rerank` | `true` | 是否启用重排（具体实现见 `rag.rerank.provider`） |
 | `rag.chunk.size` | `400` | 切片长度（字符） |
-| `rag.chunk.overlap` | `80` | 相邻切片重叠长度 |
+| `rag.chunk.overlap` | `80` | 超长段落开窗时的重叠长度 |
+| `rag.chunk.structure-aware` | `true` | 按标题层级 + 表格行切分；`false` 退回按字数硬切 |
+| `rag.chunk.context-header` | `true` | 每片加「文档 + 章节」上下文头（提升召回与重排准确率） |
 
 ### 安全与对话
 
@@ -267,6 +283,7 @@ mvn spring-boot:run
 | `POST` | `/ingest` | JSON 批量入库（已解析的纯文本） |
 | `POST` | `/ingest/file` | 上传 PDF / DOCX / 纯文本文件入库（multipart） |
 | `POST` | `/query` | 问答；多轮只需回传 `sessionId` |
+| `POST` | `/query/stream` | 流式问答（SSE），请求体同 `/query`，正文边生成边下发 |
 | `POST` | `/retrieve` | 仅检索，便于调试 |
 | `POST` | `/eval` | 检索效果评估 |
 | `GET` | `/conversation/{sessionId}` | 查看会话历史（调试 / 页面刷新后恢复） |
@@ -383,6 +400,81 @@ curl -X POST http://localhost:8080/api/rag/query \
 - `rewrittenQuery`：多轮改写后实际用于检索的问题（未改写时与 `query` 相同）；
 - `cacheHit`：是否命中语义缓存（命中时不调用检索与生成，但**同样会写入历史**）；
 - `error`：生成是否失败（失败结果不会写入缓存，也**不会写入历史**）。
+
+### 4. 流式问答（SSE）
+
+请求体与 `/query` 完全一致，响应改为 `text/event-stream`。首字延迟从同步接口的
+「整段生成完才能返回」降到 1~2 秒，观感差异巨大。
+
+```bash
+curl -N -X POST http://localhost:8080/api/rag/query/stream \
+  -H 'Content-Type: application/json' \
+  -d '{ "query": "工伤联网结算开通了哪些交易接口？",
+        "user": { "userId": "D001", "departments": ["心内科"], "roles": ["DOCTOR"], "clearanceLevel": 1 } }'
+```
+
+事件序列：
+
+```
+event: meta
+data: {"sessionId":"conv-…","rewrittenQuery":"…","cacheHit":false,"citations":[…]}
+
+event: delta
+data: {"text":"根据现有资料，"}
+
+event: delta
+data: {"text":"工伤联网结算共开通 22 个交易接口……"}
+
+event: done
+data: {"sessionId":"conv-…","latencyMs":2340,"piiMasked":true,"cacheHit":false,"error":false}
+```
+
+- `meta` 在**重排之后、生成之前**发出，前端可以先把引用面板渲染出来，正文再逐段到达；
+- `delta.text` 已做隐私脱敏，可直接渲染；
+- 异常时发 `error`（`{"message": "…"}`）且不再有 `done`；
+- 语义缓存命中时 `meta.cacheHit=true`，正文一次性下发完毕。
+
+> **注意**：`EventSource` 只支持 GET，而这里需要请求体，浏览器端要用
+> `fetch` + `ReadableStream` 自行解析（前端 `src/api/rag.js` 的 `queryStream` 即此实现）。
+> 另外 SSE 的 `data:` 必须是单行 JSON，服务端为此单独用了一个关闭缩进的序列化器。
+
+### 5. 重排配置
+
+重排默认走专用 cross-encoder 接口（DashScope `gte-rerank-v2`），而非 LLM 列表式重排：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `rag.rerank.provider` | `gte` | `gte` / `llm` / `none` |
+| `rag.rerank.base-url` | DashScope text-rerank | （`RAG_RERANK_BASE_URL`） |
+| `rag.rerank.api-key` | 空 | （`RAG_RERANK_API_KEY`） |
+| `rag.rerank.model` | `gte-rerank-v2` | （`RAG_RERANK_MODEL`） |
+| `rag.rerank.api-style` | `dashscope` | `dashscope`（input/parameters 包裹）/ `cohere`（query/documents 平铺） |
+| `rag.rerank.timeout-ms` | `2000` | 超时回退召回顺序 |
+| `rag.rerank.max-candidates` | `30` | 送入重排的候选数上限，需与 `candidate-top-k` 对齐 |
+| `rag.rerank.fail-open-to-llm` | `false` | 接口故障时是否降级到 LLM 重排 |
+
+代价对比（本机实测，20 条候选）：cross-encoder **约 300ms**；LLM 列表式重排即使关闭
+思维链也要 1s 以上。两者在 top-5 上几乎没有差别——LLM 做重排只是「输出一个编号数组」，
+属于用大炮打蚊子。
+
+> **重排看不到片段边界**：cross-encoder 逐片段打分，一个片段里没有表头、没有关键词，
+> 分就低。所以两道防线：① 入库时结构化切片，表格每片都带表头、每片都带「文档 + 章节」
+> 头（`rag.chunk.structure-aware`）；② 检索后仍把重排结果当**锚点**，由
+> `NeighborExpander` 补齐**同一章节内**的前后片段（`rag.retrieval.neighbor-expand`），
+> 兜住「一节长于一片」的情况。详见 `docs/query-performance-report.md` 第十、十一节。
+
+### 6. 查询改写
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `rag.conversation.rewrite-enabled` | `true` | 是否改写 |
+| `rag.conversation.rewrite-model` | 空 | 留空沿用 `rag.llm.model`，可指向更小的模型 |
+| `rag.conversation.rewrite-timeout-ms` | `3000` | **超时直接回退原问题**，不阻塞主链路 |
+| `rag.conversation.rewrite-max-tokens` | `128` | 改写只输出一句话 |
+
+改写处在「检索之前」的串行位置，是最容易拖垮首字延迟的一环。因此它必须满足两点：
+有硬超时、且超时后能安全降级（用原问题继续检索），失败绝不冒泡成 5xx。
+
 
 会话维护：
 

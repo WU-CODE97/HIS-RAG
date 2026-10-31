@@ -40,7 +40,7 @@ spring:
 rag:
   embedding:
     # OpenAI 兼容的 Embedding 接口地址（如 OpenAI / 通义 / 智谱 / 本地 vLLM / Ollama 等）
-    base-url: ${RAG_EMBEDDING_BASE_URL:}
+    base-url: ${RAG_EMBEDDING_BASE_URL:https://ws-86g2z252xrxypyqs.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}
     api-key: ${RAG_EMBEDDING_API_KEY:}
     model: ${RAG_EMBEDDING_MODEL:qwen3.7-text-embedding}
     # 必须与模型实际输出维度一致，否则 ES 会拒绝写入（本地内存向量库则不校验，容易静默出错）
@@ -49,11 +49,19 @@ rag:
 
   llm:
     # OpenAI 兼容的 Chat 接口地址
-    base-url: ${RAG_LLM_BASE_URL:}
+    base-url: ${RAG_LLM_BASE_URL:https://ws-86g2z252xrxypyqs.cn-beijing.maas.aliyuncs.com/compatible-mode/v1}
     api-key: ${RAG_LLM_API_KEY:}
     model: ${RAG_LLM_MODEL:qwen3.5-122b-a10b}
     temperature: 0.2
     max-tokens: 1024
+    connect-timeout-ms: 10000
+    read-timeout-ms: 120000     # 非流式调用的读超时
+    stream-timeout-ms: 180000   # 流式调用的整体超时
+    # 原样透传到上游请求体的私有参数，换厂商时只改配置、不改代码
+    # qwen 系列必须显式关闭思维链：否则每次调用先生成 3000~5000 token 推理内容，
+    # 实测重排 49.2s→1.1s、生成 42.5s→5.9s、改写 45.5s→1.7s
+    extra-body:
+      "[enable_thinking]": false
 
   bm25:
     # memory        = 内存倒排索引（零依赖，本地开发用）
@@ -97,20 +105,44 @@ rag:
   retrieval:
     vector-top-k: 20        # 向量召回候选数
     bm25-top-k: 20          # BM25 召回候选数
-    candidate-top-k: 30     # 送入 rerank 的候选数
-    final-top-k: 5          # 最终进入生成上下文的片段数
+    candidate-top-k: 30     # 送入 rerank 的候选数（重排再准，也不该先砍掉召回）
+    final-top-k: 5          # 重排后保留的锚点片段数
     vector-weight: 0.6      # 加权融合时向量权重
     bm25-weight: 0.4        # 加权融合时 BM25 权重
     use-rrf: true           # true=RRF 融合, false=加权归一化融合
     rrf-k: 60               # RRF 平滑常数
-    enable-rerank: true     # 是否启用 LLM 重排
+    enable-rerank: true     # 是否启用重排
+    # 表格 / 参数列表按固定长度切分会跨片段，逐片段打分时中间片缺表头、得分极低会被截掉，
+    # 答案就「少一截」。重排结果只作锚点，再把锚点前后各 N 片补回上下文（0=关闭）。
+    # 实测工伤 Q002「出参有哪些」：12 个出参切在 #4/#5/#6，#5 得分 0.006 排第 9 被截，
+    # 上下文只剩 4 个出参；补相邻片后 12 个齐全。
+    neighbor-expand: 1
+    max-context-chunks: 12  # 进入生成上下文的片段数上限（含补回的相邻片段）
+
+  rerank:
+    # gte  = 专用 cross-encoder 接口（推荐，20 条候选约 300ms）
+    # llm  = 原 LLM 列表式重排（慢一个数量级，仅调试或小流量用）
+    # none = 不重排，直接用融合顺序
+    provider: ${RAG_RERANK_PROVIDER:gte}
+    base-url: ${RAG_RERANK_BASE_URL:https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank}
+    api-key: ${RAG_RERANK_API_KEY:}
+    model: ${RAG_RERANK_MODEL:gte-rerank-v2}
+    # dashscope = input/parameters 包裹；cohere = query/documents 平铺
+    api-style: ${RAG_RERANK_API_STYLE:dashscope}
+    timeout-ms: 2000        # 超时后回退召回顺序，重排不能拖垮问答
+    max-candidates: 30      # 送入重排的最大候选数，需与 retrieval.candidate-top-k 对齐
+    max-doc-chars: 512      # 单篇文档截断长度
+    fail-open-to-llm: false # true=重排接口故障时降级到 LLM 重排（会慢 1s+）
 
   chunk:
     size: 400               # 切片长度（字符）
-    overlap: 80             # 相邻切片重叠长度（字符）
+    overlap: 80             # 超长段落开窗时的重叠长度（字符）
+    structure-aware: true   # 按标题层级 + 表格行切分；false 退回按字数硬切
+    context-header: true    # 每片加「文档 + 章节」上下文头，提升召回与重排准确率
 
   security:
     mask-pii: true          # 输出前是否对隐私信息脱敏
+    pii-tail-guard: 24      # 流式输出保留的尾部字符数，防止证件号/卡号被切块后漏脱敏
 
   cache:
     enabled: true
@@ -123,6 +155,9 @@ rag:
     # 多轮对话总开关：关闭后退化为单轮问答，历史既不读也不写
     enabled: true
     rewrite-enabled: true   # 是否用 LLM 把带指代的追问改写成独立问题
+    rewrite-model: ${RAG_REWRITE_MODEL:}   # 留空沿用主模型；可指向更小的模型
+    rewrite-timeout-ms: 3000   # 改写超时，超时直接用原问题检索
+    rewrite-max-tokens: 128    # 改写只输出一句话，给多了反而慢
     max-history-turns: 6    # 参与改写的最近对话轮数（1 轮 = 1 问 + 1 答）
     # 历史由服务端按 sessionId 维护，客户端只需回传 sessionId，不传 history
     session-ttl: 2h         # 会话空闲存活时间，超时后历史自动失效

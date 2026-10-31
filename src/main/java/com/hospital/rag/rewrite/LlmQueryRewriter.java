@@ -1,6 +1,7 @@
 package com.hospital.rag.rewrite;
 
 import com.hospital.rag.config.RagProperties;
+import com.hospital.rag.llm.ChatOptions;
 import com.hospital.rag.llm.LlmClient;
 import com.hospital.rag.model.ChatMessage;
 import org.slf4j.Logger;
@@ -54,10 +55,16 @@ public class LlmQueryRewriter implements QueryRewriter {
             return query;
         }
         try {
-            String rewritten = llmClient.chat(SYSTEM_PROMPT, buildPrompt(query, history));
+            // 改写只需输出一句话：限制 max-tokens 并设硬超时，超时直接回退原问题，
+            // 绝不阻塞主链路（改写处于检索之前，是串行链路的第一环）
+            String rewritten = llmClient.chat(SYSTEM_PROMPT, buildPrompt(query, history),
+                    ChatOptions.create()
+                            .model(config.getRewriteModel())
+                            .maxTokens(config.getRewriteMaxTokens())
+                            .timeoutMs(config.getRewriteTimeoutMs()));
             return sanitize(rewritten, query);
         } catch (Exception e) {
-            log.warn("查询改写失败，回退为原始问题: {}", e.getMessage());
+            log.warn("查询改写失败（超时或异常），回退为原始问题: {}", e.getMessage());
             return query;
         }
     }

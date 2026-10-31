@@ -4,6 +4,8 @@ import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * RAG 全量可配置项，前缀 {@code rag}。
@@ -18,6 +20,7 @@ public class RagProperties {
     private Vector vector = new Vector();
     private Hybrid hybrid = new Hybrid();
     private Retrieval retrieval = new Retrieval();
+    private Rerank rerank = new Rerank();
     private Chunking chunk = new Chunking();
     private Security security = new Security();
     private Cache cache = new Cache();
@@ -42,6 +45,20 @@ public class RagProperties {
         private String model = "gpt-4o-mini";
         private double temperature = 0.2;
         private int maxTokens = 1024;
+        /** 连接超时（毫秒）。 */
+        private int connectTimeoutMs = 10_000;
+        /** 非流式调用的读超时（毫秒）。 */
+        private int readTimeoutMs = 120_000;
+        /** 流式调用的整体读超时（毫秒），到达后中断并保留已产出内容。 */
+        private int streamTimeoutMs = 180_000;
+        /**
+         * 原样透传到上游请求体的额外字段，用于传递各家厂商的私有参数。
+         *
+         * <p>例如通义 / Qwen 系列需要 {@code enable_thinking=false} 才会关闭思维链，
+         * 否则单次调用会生成 3000~5000 token 的推理内容（实测重排 49s → 1.1s）。
+         * 做成透传而非硬编码，是为了换厂商时不必改代码。</p>
+         */
+        private Map<String, Object> extraBody = new LinkedHashMap<>();
     }
 
     /** BM25 检索后端配置。 */
@@ -107,19 +124,65 @@ public class RagProperties {
         private boolean useRrf = true;
         private int rrfK = 60;
         private boolean enableRerank = true;
+
+        /**
+         * 重排锚点前后补回的相邻片段数（0=关闭）。
+         *
+         * <p>切片按固定长度硬切，表格 / 参数列表天然跨片段；cross-encoder 逐片段打分时
+         * 看不到片段边界，中间那一片常因缺少表头而得分极低被截掉，答案就会「少一截」。
+         * 补回相邻片段可恢复完整性，代价只是少量上下文。</p>
+         */
+        private int neighborExpand = 1;
+
+        /** 进入生成上下文的片段数上限（含补回的相邻片段）。 */
+        private int maxContextChunks = 12;
+    }
+
+    /** 重排配置。 */
+    @Data
+    public static class Rerank {
+        /** 重排实现：{@code gte}（专用 cross-encoder 接口）/ {@code llm}（LLM 列表式）/ {@code none}。 */
+        private String provider = "gte";
+        /** 重排接口地址，默认 DashScope text-rerank。 */
+        private String baseUrl = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank";
+        private String apiKey = "";
+        private String model = "gte-rerank-v2";
+        /** 接口协议：{@code dashscope}（input/parameters 包裹）或 {@code cohere}（query/documents 平铺）。 */
+        private String apiStyle = "dashscope";
+        /** 单次重排超时，超时后用原始召回顺序兜底。 */
+        private int timeoutMs = 2_000;
+        /** 送入重排的最大候选数；cross-encoder 成本随候选数线性增长，需与 candidate-top-k 对齐。 */
+        private int maxCandidates = 30;
+        /** 单篇文档截断长度（字符），控制请求体大小。 */
+        private int maxDocChars = 512;
+        /** 重排接口不可用时是否降级到 LLM 重排（默认关闭，直接回退召回顺序更快）。 */
+        private boolean failOpenToLlm = false;
     }
 
     /** 文档切分参数。 */
     @Data
     public static class Chunking {
+        /** 单个片段的目标字符数。 */
         private int size = 400;
+        /** 超长段落开窗时的重叠字符数。 */
         private int overlap = 80;
+        /** 是否按标题层级 + 表格行结构化切分；关闭后回到「按字数硬切」。 */
+        private boolean structureAware = true;
+        /** 是否给每个片段加「文档 + 章节」上下文头（提升召回与重排准确率）。 */
+        private boolean contextHeader = true;
     }
 
     /** 安全相关参数。 */
     @Data
     public static class Security {
         private boolean maskPii = true;
+        /**
+         * 流式输出时保留的尾部字符数，不足该长度的内容先缓冲、不立即下发。
+         *
+         * <p>脱敏是基于完整文本的正则匹配，若把一个身份证号切成两段分别脱敏，两段都匹配不上。
+         * 保留 24 个字符（大于 18 位身份证 / 19 位卡号）即可避免绝大多数跨块漏脱敏。</p>
+         */
+        private int piiTailGuard = 24;
     }
 
     /** 语义缓存配置。 */
@@ -141,6 +204,12 @@ public class RagProperties {
         private boolean enabled = true;
         /** 是否启用基于历史的问题改写。 */
         private boolean rewriteEnabled = true;
+        /** 改写用的模型；留空则沿用 {@code rag.llm.model}。 */
+        private String rewriteModel = "";
+        /** 改写超时（毫秒），超时直接回退为用户原问题，不阻塞主链路。 */
+        private int rewriteTimeoutMs = 3_000;
+        /** 改写输出的 max-tokens；改写只需输出一句话，给多了反而更慢。 */
+        private int rewriteMaxTokens = 128;
         /** 参与改写的最近对话轮数（1 轮 = 1 问 + 1 答）。 */
         private int maxHistoryTurns = 6;
         /** 会话空闲存活时间，超过后历史自动失效。 */

@@ -1,5 +1,6 @@
 package com.hospital.rag.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hospital.rag.cache.SemanticCache;
 import com.hospital.rag.eval.Evaluator;
 import com.hospital.rag.model.AccessControl;
@@ -10,10 +11,14 @@ import com.hospital.rag.model.ScoredChunk;
 import com.hospital.rag.model.UserContext;
 import com.hospital.rag.retrieve.Bm25Index;
 import com.hospital.rag.retrieve.HybridSearchIndex;
+import com.hospital.rag.service.QueryStreamListener;
 import com.hospital.rag.service.RagService;
 import com.hospital.rag.store.ChunkStore;
 import com.hospital.rag.store.VectorStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,13 +30,16 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
 
 /**
  * HIS-RAG REST 接口。
@@ -40,6 +48,11 @@ import java.util.UUID;
 @RequestMapping("/api/rag")
 public class RagController {
 
+    private static final Logger log = LoggerFactory.getLogger(RagController.class);
+
+    /** 流式问答的最长静默时间，超过后容器自动结束连接。 */
+    private static final long STREAM_TIMEOUT_MS = 180_000L;
+
     private final RagService ragService;
     private final Evaluator evaluator;
     private final ChunkStore chunkStore;
@@ -47,6 +60,7 @@ public class RagController {
     private final Bm25Index bm25Index;
     private final ObjectProvider<HybridSearchIndex> hybridSearchIndex;
     private final SemanticCache semanticCache;
+    private final ExecutorService streamExecutor;
 
     public RagController(RagService ragService,
                          Evaluator evaluator,
@@ -54,7 +68,8 @@ public class RagController {
                          VectorStore vectorStore,
                          Bm25Index bm25Index,
                          ObjectProvider<HybridSearchIndex> hybridSearchIndex,
-                         SemanticCache semanticCache) {
+                         SemanticCache semanticCache,
+                         @Qualifier("ragStreamExecutor") ExecutorService streamExecutor) {
         this.ragService = ragService;
         this.evaluator = evaluator;
         this.chunkStore = chunkStore;
@@ -62,6 +77,7 @@ public class RagController {
         this.bm25Index = bm25Index;
         this.hybridSearchIndex = hybridSearchIndex;
         this.semanticCache = semanticCache;
+        this.streamExecutor = streamExecutor;
     }
 
     /** 文档入库（会自动失效语义缓存）。 */
@@ -95,6 +111,130 @@ public class RagController {
     public ResponseEntity<RagAnswer> query(@RequestBody QueryRequest request) {
         UserContext user = request.user() == null ? UserContext.guest() : request.user();
         return ResponseEntity.ok(ragService.query(request.query(), user, request.sessionId()));
+    }
+
+    /**
+     * 流式问答（SSE）。请求体与 {@link #query} 完全一致，响应改为事件流。
+     *
+     * <p>事件序列：</p>
+     * <pre>
+     * event: meta   {"sessionId":"conv-…","rewrittenQuery":"…","cacheHit":false,"citations":[…]}
+     * event: delta  {"text":"根据资料可知，"}
+     * event: delta  {"text":"工伤联网结算共开通 22 个接口……"}
+     * event: done   {"latencyMs":2340,"piiMasked":true,"cacheHit":false,"error":false}
+     * event: error  {"message":"……"}   // 仅异常时出现，出现后不再有 done
+     * </pre>
+     *
+     * <p>{@code meta} 在重排之后、生成之前发出，因此前端可以先把引用渲染出来，
+     * 正文随后逐段到达。EventSource 只支持 GET，所以浏览器端需用 fetch + ReadableStream 消费。</p>
+     */
+    @PostMapping(value = "/query/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter queryStream(@RequestBody QueryRequest request) {
+        UserContext user = request.user() == null ? UserContext.guest() : request.user();
+        SseEmitter emitter = new SseEmitter(STREAM_TIMEOUT_MS);
+        SseSession session = new SseSession(emitter);
+
+        streamExecutor.submit(() -> {
+            try {
+                ragService.queryStream(request.query(), user, request.sessionId(), session);
+            } catch (Exception e) {
+                session.fail(e);
+            } finally {
+                session.close();
+            }
+        });
+        return emitter;
+    }
+
+    /** 把 {@link QueryStreamListener} 的事件翻译成 SSE 事件，并处理客户端断开。 */
+    private static final class SseSession implements QueryStreamListener {
+
+        /**
+         * SSE 专用序列化器：必须关闭缩进。
+         *
+         * <p>全局 Jackson 配了 {@code indent-output: true}，格式化后的 JSON 含换行，
+         * 写进 SSE 会被拆成多条 {@code data:} 行，前端要按规范拼接才能还原；
+         * 而且每个正文分片都带缩进空白，白白放大流量。</p>
+         */
+        private static final ObjectMapper STREAM_JSON = new ObjectMapper();
+
+        private final SseEmitter emitter;
+        /** 客户端断开或已结束时置位，后续事件直接丢弃。 */
+        private volatile boolean closed;
+
+        private SseSession(SseEmitter emitter) {
+            this.emitter = emitter;
+        }
+
+        @Override
+        public void onStart(String sessionId, String rewrittenQuery,
+                            List<RagAnswer.Citation> citations, boolean cacheHit) {
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("sessionId", sessionId);
+            data.put("rewrittenQuery", rewrittenQuery);
+            data.put("cacheHit", cacheHit);
+            data.put("citations", citations);
+            send("meta", data);
+        }
+
+        @Override
+        public void onDelta(String text) {
+            if (text == null || text.isEmpty()) {
+                return;
+            }
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("text", text);
+            send("delta", data);
+        }
+
+        @Override
+        public void onComplete(RagAnswer answer) {
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("sessionId", answer.getSessionId());
+            data.put("rewrittenQuery", answer.getRewrittenQuery());
+            data.put("latencyMs", answer.getLatencyMs());
+            data.put("piiMasked", answer.isPiiMasked());
+            data.put("cacheHit", answer.isCacheHit());
+            data.put("error", answer.isError());
+            send("done", data);
+        }
+
+        @Override
+        public void onError(Throwable error) {
+            fail(error);
+        }
+
+        void fail(Throwable error) {
+            log.warn("流式问答失败: {}", error.getMessage());
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("message", error.getMessage() == null ? "问答失败" : error.getMessage());
+            send("error", data);
+        }
+
+        void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                emitter.complete();
+            } catch (Exception ignored) {
+                // 客户端已断开，忽略
+            }
+        }
+
+        private void send(String event, Object data) {
+            if (closed) {
+                return;
+            }
+            try {
+                String payload = data instanceof String text ? text : STREAM_JSON.writeValueAsString(data);
+                emitter.send(SseEmitter.event().name(event).data(payload));
+            } catch (Exception e) {
+                // 客户端主动断开（刷新 / 关闭页面）：停止推送，不再抛给调用链
+                closed = true;
+            }
+        }
     }
 
     /**

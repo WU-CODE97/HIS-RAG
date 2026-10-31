@@ -54,6 +54,8 @@ public class RagAnswer {
         private String chunkId;
         private String documentId;
         private String documentTitle;
+        /** 片段所在章节路径，便于前端显示「这段出自哪一节」。 */
+        private String section;
         private int chunkIndex;
         private double score;
         private String snippet;

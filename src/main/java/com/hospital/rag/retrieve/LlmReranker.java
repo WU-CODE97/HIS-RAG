@@ -1,11 +1,11 @@
 package com.hospital.rag.retrieve;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hospital.rag.llm.ChatOptions;
 import com.hospital.rag.llm.LlmClient;
 import com.hospital.rag.model.ScoredChunk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -17,8 +17,11 @@ import java.util.Set;
  *
  * <p>将候选片段编号后交给模型，要求其按相关度输出有序编号数组，再据此重排。
  * 解析失败或调用异常时降级为原始顺序，保证链路可用。</p>
+ *
+ * <p><b>默认不再使用</b>：LLM 重排固有成本高（即使关闭思维链，单次也在 1s 量级，
+ * 且质量与专用 cross-encoder 差距很小），现仅作为 {@code rag.rerank.provider=llm}
+ * 或重排接口故障时的可选兜底，见 {@link HttpReranker}。</p>
  */
-@Component
 public class LlmReranker implements Reranker {
 
     private static final Logger log = LoggerFactory.getLogger(LlmReranker.class);
@@ -48,7 +51,8 @@ public class LlmReranker implements Reranker {
 
         List<Integer> order;
         try {
-            String response = llmClient.chat(SYSTEM_PROMPT, buildPrompt(query, candidates));
+            String response = llmClient.chat(SYSTEM_PROMPT, buildPrompt(query, candidates),
+                    ChatOptions.create().maxTokens(256).timeoutMs(30_000));
             order = parseOrder(response, candidates.size());
         } catch (Exception e) {
             log.warn("LLM 重排失败，降级为原始顺序: {}", e.getMessage());

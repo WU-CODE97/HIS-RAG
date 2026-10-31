@@ -1,11 +1,13 @@
 package com.hospital.rag.retrieve;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch.core.BulkRequest;
 import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.SearchRequest;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.core.search.Hit;
+import co.elastic.clients.json.JsonData;
 import com.hospital.rag.config.RagProperties;
 import com.hospital.rag.model.AccessControl;
 import com.hospital.rag.model.Chunk;
@@ -85,6 +87,7 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
                 + "\"documentId\":{\"type\":\"keyword\"},"
                 + "\"documentTitle\":{\"type\":\"text\"},"
                 + "\"content\":{\"type\":\"text\"},"
+                + "\"section\":{\"type\":\"text\",\"fields\":{\"keyword\":{\"type\":\"keyword\",\"ignore_above\":512}}},"
                 + "\"chunkIndex\":{\"type\":\"integer\"},"
                 + "\"departments\":{\"type\":\"keyword\"},"
                 + "\"roles\":{\"type\":\"keyword\"},"
@@ -227,6 +230,45 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
         return results;
     }
 
+    /**
+     * 按文档取连续下标区间的片段（邻接扩展用）。
+     *
+     * <p>用 {@code documentId} 精确匹配 + {@code chunkIndex} 区间过滤，按下标升序返回。
+     * 片段数很少（一份文档几十条），一次往返即可，不影响问答延迟。</p>
+     */
+    @Override
+    public List<Chunk> loadWindow(String documentId, int fromIndex, int toIndex) {
+        List<Chunk> chunks = new ArrayList<>();
+        if (documentId == null || toIndex < fromIndex) {
+            return chunks;
+        }
+        int from = Math.max(0, fromIndex);
+        try {
+            SearchRequest request = new SearchRequest.Builder()
+                    .index(indexName)
+                    .query(q -> q.bool(b -> b
+                            .filter(f -> f.term(t -> t.field("documentId").value(documentId)))
+                            .filter(f -> f.range(r -> r
+                                    .field("chunkIndex")
+                                    .gte(JsonData.of(from))
+                                    .lte(JsonData.of(toIndex))))))
+                    .size(toIndex - from + 1)
+                    .sort(s -> s.field(f -> f.field("chunkIndex").order(SortOrder.Asc)))
+                    .source(s -> s.filter(f -> f.excludes(EMBEDDING_FIELD)))
+                    .build();
+            SearchResponse<HybridDoc> response = client.search(request, HybridDoc.class);
+            for (Hit<HybridDoc> hit : response.hits().hits()) {
+                if (hit.source() != null) {
+                    chunks.add(toChunk(hit.source()));
+                }
+            }
+        } catch (Exception e) {
+            log.warn("按文档取相邻片段失败: documentId={}, 区间=[{}, {}], {}",
+                    documentId, from, toIndex, e.getMessage());
+        }
+        return chunks;
+    }
+
     /** 索引内文档总数。 */
     @Override
     public int size() {
@@ -269,6 +311,7 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
                 chunk.getDocumentId(),
                 chunk.getDocumentTitle(),
                 chunk.getContent(),
+                chunk.getSection(),
                 chunk.getIndex(),
                 acl == null ? Collections.emptyList() : new ArrayList<>(acl.getDepartments()),
                 acl == null ? Collections.emptyList() : new ArrayList<>(acl.getRoles()),
@@ -290,6 +333,7 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
                 .documentId(doc.getDocumentId())
                 .documentTitle(doc.getDocumentTitle())
                 .content(doc.getContent())
+                .section(doc.getSection())
                 .index(doc.getChunkIndex() == null ? 0 : doc.getChunkIndex())
                 .accessControl(acl)
                 .build();
@@ -304,6 +348,7 @@ public class ElasticsearchHybridIndex implements HybridSearchIndex {
         private String documentId;
         private String documentTitle;
         private String content;
+        private String section;
         private Integer chunkIndex;
         private List<String> departments;
         private List<String> roles;

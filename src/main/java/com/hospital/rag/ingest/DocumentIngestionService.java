@@ -107,7 +107,7 @@ public class DocumentIngestionService {
         if (document == null || document.getId() == null) {
             throw new IllegalArgumentException("document 及其 id 不能为空");
         }
-        List<String> pieces = textSplitter.split(document.getContent());
+        List<TextPiece> pieces = textSplitter.split(document.getContent(), document.getTitle());
         if (pieces.isEmpty()) {
             log.warn("文档 {} 内容为空，跳过入库", document.getId());
             return 0;
@@ -115,11 +115,13 @@ public class DocumentIngestionService {
 
         List<Chunk> chunks = new ArrayList<>(pieces.size());
         for (int i = 0; i < pieces.size(); i++) {
+            TextPiece piece = pieces.get(i);
             chunks.add(Chunk.builder()
                     .id(document.getId() + "#" + i)
                     .documentId(document.getId())
                     .documentTitle(document.getTitle())
-                    .content(pieces.get(i))
+                    .content(piece.content())
+                    .section(piece.section())
                     .index(i)
                     .metadata(document.getMetadata())
                     .accessControl(document.getAccessControl())
@@ -129,8 +131,8 @@ public class DocumentIngestionService {
         // 1. 片段库
         chunkStore.saveAll(chunks);
 
-        // 2. 向量化
-        List<float[]> vectors = embeddingModel.embedBatch(pieces);
+        // 2. 向量化（送入的是带上下文头的正文，向量本身也带上了出处语义）
+        List<float[]> vectors = embeddingModel.embedBatch(pieces.stream().map(TextPiece::content).toList());
 
         // 3. 写入检索后端
         HybridSearchIndex hybrid = hybridSearchIndex.getIfAvailable();

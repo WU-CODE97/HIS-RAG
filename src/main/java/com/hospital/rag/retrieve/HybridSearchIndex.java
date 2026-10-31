@@ -38,6 +38,21 @@ public interface HybridSearchIndex {
      */
     List<ScoredChunk> search(String queryText, float[] queryVector, int topK);
 
+    /**
+     * 按文档取连续下标区间的片段，用于检索后的邻接扩展。
+     *
+     * <p>表格 / 参数列表按固定长度切分会跨片段，重排只命中其中一片时，
+     * 补回相邻片段才能保证答案完整。实现应按下标升序返回，越界自动裁剪。</p>
+     *
+     * @param documentId 文档 id
+     * @param fromIndex  起始下标（含）
+     * @param toIndex    结束下标（含）
+     * @return 命中的片段；后端不可用时返回空列表
+     */
+    default List<Chunk> loadWindow(String documentId, int fromIndex, int toIndex) {
+        return List.of();
+    }
+
     /** 索引内文档总数。 */
     int size();
 

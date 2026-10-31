@@ -29,6 +29,9 @@ public class Chunk {
     /** 片段正文。 */
     private String content;
 
+    /** 片段所在章节路径，形如 {@code 医保接口开发差异 > 新增交易【Q002】... > 输出}。 */
+    private String section;
+
     /** 片段在文档中的序号（从 0 开始）。 */
     private int index;
 

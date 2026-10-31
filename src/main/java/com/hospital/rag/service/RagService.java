@@ -12,6 +12,7 @@ import com.hospital.rag.model.RagAnswer;
 import com.hospital.rag.model.ScoredChunk;
 import com.hospital.rag.model.UserContext;
 import com.hospital.rag.retrieve.Reranker;
+import com.hospital.rag.retrieve.NeighborExpander;
 import com.hospital.rag.retrieve.Retriever;
 import com.hospital.rag.rewrite.QueryRewriter;
 import org.slf4j.Logger;
@@ -46,6 +47,7 @@ public class RagService {
     private final QueryRewriter queryRewriter;
     private final SemanticCache semanticCache;
     private final ConversationStore conversationStore;
+    private final NeighborExpander neighborExpander;
     private final RagProperties.Retrieval retrievalConfig;
 
     public RagService(DocumentIngestionService ingestionService,
@@ -55,6 +57,7 @@ public class RagService {
                       QueryRewriter queryRewriter,
                       SemanticCache semanticCache,
                       ConversationStore conversationStore,
+                      NeighborExpander neighborExpander,
                       RagProperties properties) {
         this.ingestionService = ingestionService;
         this.retriever = retriever;
@@ -63,6 +66,7 @@ public class RagService {
         this.queryRewriter = queryRewriter;
         this.semanticCache = semanticCache;
         this.conversationStore = conversationStore;
+        this.neighborExpander = neighborExpander;
         this.retrievalConfig = properties.getRetrieval();
     }
 
@@ -141,17 +145,9 @@ public class RagService {
             return hit;
         }
 
-        // 4. 混合召回
-        int candidateK = Math.max(retrievalConfig.getCandidateTopK(), retrievalConfig.getFinalTopK());
-        List<ScoredChunk> candidates = retriever.retrieve(effectiveQuery, effectiveUser, candidateK);
-
-        // 5. 重排
-        List<ScoredChunk> contexts;
-        if (retrievalConfig.isEnableRerank() && !candidates.isEmpty()) {
-            contexts = reranker.rerank(effectiveQuery, candidates, retrievalConfig.getFinalTopK());
-        } else {
-            contexts = new ArrayList<>(candidates.subList(0, Math.min(retrievalConfig.getFinalTopK(), candidates.size())));
-        }
+        // 4 & 5. 混合召回 + 重排
+        List<ScoredChunk> candidates = retriever.retrieve(effectiveQuery, effectiveUser, candidateK());
+        List<ScoredChunk> contexts = rerank(effectiveQuery, candidates, effectiveUser);
 
         // 6. 生成（用改写后的问题做检索与生成，但对外保留用户原问题）
         RagAnswer answer = answerGenerator.generate(effectiveQuery, contexts);
@@ -174,8 +170,87 @@ public class RagService {
         return answer;
     }
 
-    /** 读取会话历史（供调试接口使用，同样受归属校验约束）。 */
-    public List<ChatMessage> history(String sessionId, UserContext user) {
+    /**
+     * 流式问答：与 {@link #query(String, UserContext, String)} 同一条链路，但正文边生成边下发。
+     *
+     * <p>事件顺序为 {@code onStart}（引用已就绪）→ {@code onDelta} × N → {@code onComplete}。
+     * 语义缓存命中时正文会一次性回调，前端无需区分。</p>
+     *
+     * @param listener 事件回调，由传输层（SSE）实现
+     * @return 完整答案（用于缓存回填与会话历史，调用方可忽略）
+     */
+    public RagAnswer queryStream(String query, UserContext user, String sessionId,
+                                 QueryStreamListener listener) {
+        long start = System.currentTimeMillis();
+        UserContext effectiveUser = user == null ? UserContext.guest() : user;
+        String session = (sessionId == null || sessionId.isBlank()) ? newSessionId() : sessionId;
+
+        // 1. 取历史 → 2. 多轮改写
+        List<ChatMessage> history = conversationStore.history(session, effectiveUser);
+        String effectiveQuery = queryRewriter.rewrite(query, history);
+
+        // 3. 语义缓存：命中则正文一次性下发，省掉检索与生成
+        Optional<RagAnswer> cached = semanticCache.get(effectiveQuery, effectiveUser);
+        if (cached.isPresent()) {
+            RagAnswer hit = cached.get();
+            hit.setSessionId(session);
+            hit.setCacheHit(true);
+            hit.setRewrittenQuery(effectiveQuery);
+            hit.setLatencyMs(System.currentTimeMillis() - start);
+            listener.onStart(session, effectiveQuery, hit.getCitations(), true);
+            if (hit.getAnswer() != null && !hit.getAnswer().isEmpty()) {
+                listener.onDelta(hit.getAnswer());
+            }
+            recordTurn(session, effectiveUser, query, hit);
+            listener.onComplete(hit);
+            log.info("流式问答命中缓存: session={}, query='{}', 耗时={}ms", session, effectiveQuery, hit.getLatencyMs());
+            return hit;
+        }
+
+        // 4 & 5. 召回 + 重排（先把引用推给前端，避免等待正文时页面空白）
+        List<ScoredChunk> candidates = retriever.retrieve(effectiveQuery, effectiveUser, candidateK());
+        List<ScoredChunk> contexts = rerank(effectiveQuery, candidates, effectiveUser);
+        listener.onStart(session, effectiveQuery, answerGenerator.citations(contexts), false);
+
+        // 6. 流式生成
+        RagAnswer answer = answerGenerator.generateStreaming(effectiveQuery, contexts, listener::onDelta);
+        answer.setSessionId(session);
+        answer.setQuery(query);
+        answer.setRewrittenQuery(effectiveQuery);
+        answer.setCacheHit(false);
+        answer.setLatencyMs(System.currentTimeMillis() - start);
+
+        // 7. 回填缓存（仅成功结果）
+        if (!answer.isError()) {
+            semanticCache.put(effectiveQuery, effectiveUser, answer);
+        }
+
+        // 8. 回写历史
+        recordTurn(session, effectiveUser, query, answer);
+
+        listener.onComplete(answer);
+        log.info("流式问答完成: session={}, query='{}', 改写后='{}', 召回={}, 上下文={}, 耗时={}ms",
+                session, query, effectiveQuery, candidates.size(), contexts.size(), answer.getLatencyMs());
+        return answer;
+    }
+
+    /** 送入重排 / 生成前的召回条数。 */
+    private int candidateK() {
+        return Math.max(retrievalConfig.getCandidateTopK(), retrievalConfig.getFinalTopK());
+    }
+
+    /** 重排；关闭重排时直接截断召回结果。重排结果只作为「锚点」，随后补齐相邻片段。 */
+    private List<ScoredChunk> rerank(String query, List<ScoredChunk> candidates, UserContext user) {
+        List<ScoredChunk> anchors;
+        if (retrievalConfig.isEnableRerank() && !candidates.isEmpty()) {
+            anchors = reranker.rerank(query, candidates, retrievalConfig.getFinalTopK());
+        } else {
+            anchors = new ArrayList<>(candidates.subList(0, Math.min(retrievalConfig.getFinalTopK(), candidates.size())));
+        }
+        return neighborExpander.expand(anchors, user);
+    }
+
+    /** 读取会话历史（供调试接口使用，同样受归属校验约束）。 */    public List<ChatMessage> history(String sessionId, UserContext user) {
         return conversationStore.history(sessionId, user);
     }
 
